@@ -18,8 +18,10 @@ app.use(bodyParser.urlencoded({
   extended: true
 }));
 
+if (!process.env.SESSION_SECRET) throw new Error("SESSION_SECRET is required");
+
 app.use(session({
-  secret: "Our little secret.",
+  secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false
 }));
@@ -27,8 +29,7 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
-mongoose.connect("mongodb://localhost:27017/userDB", {useNewUrlParser: true});
-mongoose.set("useCreateIndex", true);
+const databaseUri = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/userDB";
 
 const userSchema = new mongoose.Schema ({
   email: String,
@@ -40,7 +41,7 @@ const userSchema = new mongoose.Schema ({
 userSchema.plugin(passportLocalMongoose);
 userSchema.plugin(findOrCreate);
 
-const User = new mongoose.model("User", userSchema);
+const User = mongoose.model("User", userSchema);
 
 passport.use(User.createStrategy());
 
@@ -57,12 +58,10 @@ passport.deserializeUser(function(id, done) {
 passport.use(new GoogleStrategy({
     clientID: process.env.CLIENT_ID,
     clientSecret: process.env.CLIENT_SECRET,
-    callbackURL: "http://localhost:3000/auth/google/secrets",
+    callbackURL: process.env.OAUTH_CALLBACK_URL || "http://localhost:3000/auth/google/secrets",
     userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo"
   },
   function(accessToken, refreshToken, profile, cb) {
-    console.log(profile);
-
     User.findOrCreate({ googleId: profile.id }, function (err, user) {
       return cb(err, user);
     });
@@ -92,15 +91,10 @@ app.get("/register", function(req, res){
   res.render("register");
 });
 
-app.get("/secrets", function(req, res){
-  User.find({"secret": {$ne: null}}, function(err, foundUsers){
-    if (err){
-      console.log(err);
-    } else {
-      if (foundUsers) {
-        res.render("secrets", {usersWithSecrets: foundUsers});
-      }
-    }
+app.get("/secrets", function(req, res, next) {
+  User.find({"secret": {$ne: null}}, function(err, foundUsers) {
+    if (err) return next(err);
+    res.render("secrets", {usersWithSecrets: foundUsers});
   });
 });
 
@@ -112,23 +106,18 @@ app.get("/submit", function(req, res){
   }
 });
 
-app.post("/submit", function(req, res){
+app.post("/submit", function(req, res, next) {
+  if (!req.isAuthenticated()) return res.redirect("/login");
   const submittedSecret = req.body.secret;
-
-//Once the user is authenticated and their session gets saved, their user details are saved to req.user.
-  // console.log(req.user.id);
-
-  User.findById(req.user.id, function(err, foundUser){
-    if (err) {
-      console.log(err);
-    } else {
-      if (foundUser) {
-        foundUser.secret = submittedSecret;
-        foundUser.save(function(){
-          res.redirect("/secrets");
-        });
-      }
-    }
+  if (typeof submittedSecret !== "string") return res.status(400).send("Secret must be text");
+  User.findById(req.user.id, function(err, foundUser) {
+    if (err) return next(err);
+    if (!foundUser) return res.redirect("/login");
+    foundUser.secret = submittedSecret;
+    foundUser.save(function(saveError) {
+      if (saveError) return next(saveError);
+      res.redirect("/secrets");
+    });
   });
 });
 
@@ -137,7 +126,15 @@ app.get("/logout", function(req, res){
   res.redirect("/");
 });
 
-app.post("/register", function(req, res){
+function validateCredentials(req, res, next) {
+  const {username, password} = req.body;
+  if (typeof username !== "string" || typeof password !== "string") {
+    return res.status(400).send("Username and password must be text");
+  }
+  next();
+}
+
+app.post("/register", validateCredentials, function(req, res){
 
   User.register({username: req.body.username}, req.body.password, function(err, user){
     if (err) {
@@ -152,31 +149,13 @@ app.post("/register", function(req, res){
 
 });
 
-app.post("/login", function(req, res){
-
-  const user = new User({
-    username: req.body.username,
-    password: req.body.password
-  });
-
-  req.login(user, function(err){
-    if (err) {
-      console.log(err);
-    } else {
-      passport.authenticate("local")(req, res, function(){
-        res.redirect("/secrets");
-      });
-    }
-  });
-
+app.post("/login", validateCredentials, passport.authenticate("local"), function(req, res) {
+  res.redirect("/secrets");
 });
 
-
-
-
-
-
-
-app.listen(3000, function() {
-  console.log("Server started on port 3000.");
-});
+mongoose.connect(databaseUri)
+  .then(() => app.listen(process.env.PORT || 3000, () => console.log("Server started successfully")))
+  .catch(err => {
+    console.error("MongoDB connection failed", err.name);
+    process.exitCode = 1;
+  });
